@@ -1,0 +1,20 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default-deny everything
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Shared templates rules
+    match /shared_templates/{templateId} {
+      allow read: if true;
+      allow write: if true;
+    }
+
+    // Student submissions rules
+    match /student_submissions/{submissionId} {
+      allow read, write: if true;
+    }
+  }
+}

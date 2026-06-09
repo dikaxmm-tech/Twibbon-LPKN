@@ -1,0 +1,6 @@
+{
+  "name": "Pembuat Twibbon 4:5",
+  "description": "Situs pembuat twibbon interaktif dengan rasio 4:5, mendukung unggah bingkai twibbon, pasang foto, sesuaikan posisi, skala, rotasi, filter warna, dan unduh hasil resolusi tinggi.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

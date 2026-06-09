@@ -1,0 +1,46 @@
+{
+  "entities": {
+    "shared_template": {
+      "title": "Shared Template",
+      "description": "Custom twibbon template shared with everyone",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique template ID" },
+        "name": { "type": "string", "description": "Name of the template" },
+        "category": { "type": "string", "description": "Category of the template" },
+        "description": { "type": "string", "description": "Description of the template" },
+        "previewColor": { "type": "string", "description": "Tailwind gradient/color for preview card" },
+        "accentColor": { "type": "string", "description": "Accent hex color" },
+        "imageUrl": { "type": "string", "description": "High-res transparent base64 string of the frame" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
+      },
+      "required": ["id", "name", "imageUrl", "createdAt"]
+    },
+    "student_submission": {
+      "title": "Student Submission",
+      "description": "Customized twibbon submission uploaded by a student",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique submission ID" },
+        "studentName": { "type": "string", "description": "Name of the student" },
+        "studentClass": { "type": "string", "description": "Class or team of the student" },
+        "fileName": { "type": "string", "description": "Intended file name" },
+        "imageUrl": { "type": "string", "description": "Base64 image data or URL of the completed twibbon" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Submission/generation timestamp" },
+        "templateId": { "type": "string", "description": "ID of template used" },
+        "syncedToDrive": { "type": "boolean", "description": "Whether synced to Google Drive" }
+      },
+      "required": ["id", "studentName", "studentClass", "imageUrl", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/shared_templates/{templateId}": {
+      "schema": "shared_template",
+      "description": "Shared templates collection accessible by all users"
+    },
+    "/student_submissions/{submissionId}": {
+      "schema": "student_submission",
+      "description": "Completed student twibbon submissions"
+    }
+  }
+}
