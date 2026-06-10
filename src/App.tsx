@@ -22,22 +22,27 @@ import {
   ExternalLink,
   Lock
 } from 'lucide-react';
-import { initAuth, googleSignIn, logout, getAccessToken } from './utils/firebaseAuth';
 import { uploadFileToDrive } from './utils/googleDrive';
-import { User } from 'firebase/auth';
-import { getFrameBlob, setFrameBlob, getCustomTemplatesList, setCustomTemplatesList } from './utils/idb';
+import { 
+  initiateGoogleOAuth, 
+  parseOAuthHash, 
+  fetchGoogleProfile, 
+  GoogleProfile 
+} from './utils/googleAuthCustom';
+import { getFrameBlob, setFrameBlob, getCustomTemplatesList, setCustomTemplatesList, deleteFrameBlob } from './utils/idb';
 import { createCompressedThumbnail } from './utils/thumbnail';
 import { 
-  compressFrameForFirestore, 
-  saveTemplateToFirestore, 
-  getTemplatesFromFirestore, 
-  setGlobalDefaultTemplateInFirestore,
-  saveStudentSubmissionToFirestore,
-  getStudentSubmissionsFromFirestore,
-  updateSubmissionSyncStatusInFirestore,
-  deleteSubmissionFromFirestore,
-  compressCanvasForFirestore
-} from './utils/firestoreTemplates';
+  compressFrameForStorage, 
+  saveTemplateToServer, 
+  getTemplatesFromServer, 
+  setGlobalDefaultTemplateOnServer,
+  saveStudentSubmissionToServer,
+  getStudentSubmissionsFromServer,
+  updateSubmissionSyncStatusOnServer,
+  deleteSubmissionFromServer,
+  deleteTemplateFromServer,
+  compressCanvasForStorage
+} from './utils/serverTemplates';
 
 const INITIAL_PARAMS: PhotoParams = {
   x: 0,
@@ -69,7 +74,7 @@ export default function App() {
   const [templates, setTemplates] = useState<TwibbonTemplate[]>(TWIBBON_TEMPLATES);
 
   // Google OAuth Drive Access States
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUser] = useState<GoogleProfile | null>(null);
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const [isUploadingToDrive, setIsUploadingToDrive] = useState<boolean>(false);
@@ -111,6 +116,16 @@ export default function App() {
   const [deletePassword, setDeletePassword] = useState<string>('');
   const [deleteError, setDeleteError] = useState<string | null>(null);
 
+  // Password-protected template deletion states
+  const [deleteTemplatePromptId, setDeleteTemplatePromptId] = useState<string | null>(null);
+  const [deleteTemplatePassword, setDeleteTemplatePassword] = useState<string>('');
+  const [deleteTemplateError, setDeleteTemplateError] = useState<string | null>(null);
+
+  // Admin section state and security
+  const [isAdminUnlocked, setIsAdminUnlocked] = useState<boolean>(false);
+  const [serverHasDriveToken, setServerHasDriveToken] = useState<boolean>(false);
+  const [adminPasswordInput, setAdminPasswordInput] = useState<string>('');
+
   // Helper helper to convert base64 to Blob safely
   const base64ToBlob = (base64: string, mimeType: string = 'image/jpeg'): Blob => {
     const parts = base64.split(',');
@@ -141,7 +156,7 @@ export default function App() {
     };
   }, [photoUrl, frameUrl]);
 
-  // Load custom templates from localStorage, IndexedDB, and Cloud Firestore (highly optimized for iOS Safari)
+  // Load custom templates from localStorage, IndexedDB, and Server Database (highly optimized for iOS Safari)
   useEffect(() => {
     const loadSavedTemplates = async () => {
       let unifiedCustomList: TwibbonTemplate[] = [];
@@ -181,9 +196,9 @@ export default function App() {
         console.error('Failed to load custom templates from IndexedDB:', idbErr);
       }
 
-      // 3. Query Cloud Firestore shared templates (accessible to any student globally!)
+      // 3. Query centralized shared templates (accessible to any student globally!)
       try {
-        const cloudTemplates = await getTemplatesFromFirestore();
+        const cloudTemplates = await getTemplatesFromServer();
         if (cloudTemplates && cloudTemplates.length > 0) {
           const cloudCleaned = cloudTemplates.map(t => ({ ...t, localUrl: undefined }));
           const seenIds = new Set(unifiedCustomList.map(t => t.id));
@@ -198,7 +213,7 @@ export default function App() {
           }
         }
       } catch (cloudErr) {
-        console.error('Failed to load shared templates from Firestore cloud database:', cloudErr);
+        console.error('Failed to load shared templates from local database:', cloudErr);
       }
 
       // Update the react state in one single render frame
@@ -210,7 +225,7 @@ export default function App() {
         const urlParams = new URLSearchParams(window.location.search);
         let urlId = urlParams.get('id') || urlParams.get('templateId') || urlParams.get('template');
         
-        // If no explicit ID in the URL, check if there is a designated global default frame inside Firestore
+        // If no explicit ID in the URL, check if there is a designated global default frame inside Server Database
         if (!urlId) {
           const defaultCampaign = combinedTemplates.find(t => t.isDefault);
           if (defaultCampaign) {
@@ -250,21 +265,65 @@ export default function App() {
     };
 
     loadSavedTemplates();
-  }, []);
 
-  // Initialize Auth state listener
-  useEffect(() => {
-    const unsubscribe = initAuth(
-      (currentUser, token) => {
-        setUser(currentUser);
-        setAccessToken(token);
-      },
-      () => {
-        setUser(null);
-        setAccessToken(null);
+    // 1. Check if we just redirected back from Google OAuth with an access token in URL fragment
+    const urlToken = parseOAuthHash();
+    if (urlToken) {
+      setAccessToken(urlToken);
+      setServerHasDriveToken(true);
+      
+      // Fetch direct profile from Google in parallel
+      fetchGoogleProfile(urlToken).then(async (profile) => {
+        if (profile) {
+          setUser(profile);
+          triggerNotification(`Selamat datang, ${profile.displayName}! Google Drive berhasil tersambung.`, 'success');
+          
+          // Sync it immediately to the server
+          try {
+            await fetch('/api/admin/token', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ accessToken: urlToken })
+            });
+          } catch (e) {
+            console.error('Failed to sync direct oauth token to server:', e);
+          }
+        }
+      });
+    }
+
+    // 2. Check if admin session was previously unlocked or if ?admin=true is in URL parameters
+    const urlParams = new URLSearchParams(window.location.search);
+    const unlocked = sessionStorage.getItem('twibbon_admin_unlocked') === 'true' || urlParams.get('admin') === 'true';
+    if (unlocked) {
+      setIsAdminUnlocked(true);
+      sessionStorage.setItem('twibbon_admin_unlocked', 'true');
+    }
+
+    // 3. Check whether backend currently holds a Google Drive access token
+    const checkServerToken = async () => {
+      try {
+        const response = await fetch('/api/admin/token');
+        const data = await response.json();
+        if (data && data.accessToken) {
+          setServerHasDriveToken(true);
+          setAccessToken(data.accessToken);
+          
+          // Also check/retrieve Google profile details using this active token
+          const profile = await fetchGoogleProfile(data.accessToken);
+          if (profile) {
+            setUser(profile);
+          }
+        } else if (!urlToken) {
+          setServerHasDriveToken(false);
+          setAccessToken(null);
+          setUser(null);
+        }
+      } catch (err) {
+        console.error('Error checking server token:', err);
       }
-    );
-    return () => unsubscribe();
+    };
+    checkServerToken();
   }, []);
 
   // Sync loaded files to Google Drive automatically once Drive gets connected
@@ -291,24 +350,19 @@ export default function App() {
 
   // Google Sign-In & Auth Actions
   const handleLogin = async () => {
+    if (isIframe) {
+      triggerNotification('Membuka aplikasi di tab baru agar login Google Drive aman & bebas hambatan...', 'success');
+      setTimeout(() => {
+        window.open(window.location.href, '_blank');
+      }, 1000);
+      return;
+    }
     setIsConnecting(true);
     try {
-      const result = await googleSignIn();
-      if (result) {
-        setUser(result.user);
-        setAccessToken(result.accessToken);
-        triggerNotification('Berhasil terhubung dengan Google Drive Admin!', 'success');
-      }
+      initiateGoogleOAuth();
     } catch (err: any) {
       console.error('Google sign-in error:', err);
-      if (err?.code === 'auth/popup-closed-by-user' || err?.message?.includes('popup-closed-by-user')) {
-        triggerNotification(
-          'Gagal masuk: Jendela login ditutup sebelum selesai. Jika Anda berada di iFrame, klik tombol "Buka di Tab Baru" di panel sinkronisasi di bawah.', 
-          'error'
-        );
-      } else {
-        triggerNotification(`Gagal terhubung ke Google Drive: ${err?.message || 'Error tidak diketahui'}`, 'error');
-      }
+      triggerNotification(`Gagal terhubung ke Google Drive: ${err?.message || 'Error tidak diketahui'}`, 'error');
     } finally {
       setIsConnecting(false);
     }
@@ -316,9 +370,15 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
-      await logout();
       setUser(null);
       setAccessToken(null);
+      setServerHasDriveToken(false);
+      
+      // Delete token from server
+      await fetch('/api/admin/token', {
+        method: 'DELETE'
+      });
+      triggerNotification('Google Drive dan Sesi Admin Terputus.', 'success');
     } catch (err) {
       console.error('Logout error:', err);
     }
@@ -346,56 +406,60 @@ export default function App() {
 
   const loadSubmissionsAndSync = async (autoUpload: boolean = false) => {
     try {
-      const list = await getStudentSubmissionsFromFirestore();
+      const list = await getStudentSubmissionsFromServer();
       setSubmissions(list);
 
-      // Auto Upload logic for Admin (if accessToken is present)
-      if (autoUpload && accessToken && list.length > 0) {
+      // Robust Server-Side Google Drive Automatic Synchronization
+      if (autoUpload && list.length > 0) {
         const unsynced = list.filter(sub => !sub.syncedToDrive);
         if (unsynced.length > 0) {
           setIsSyncingAll(true);
-          let successCount = 0;
-          for (const sub of unsynced) {
-            try {
-              // Convert base64 data to Blob
-              const blob = base64ToBlob(sub.imageUrl, 'image/jpeg');
-              
-              // Upload to Google Drive target folder (specified in googleDrive.ts)
-              const driveResult = await uploadFileToDrive(
-                blob,
-                `Submisi_${sub.studentClass}_${sub.studentName.replace(/\s+/g, '_')}_${Date.now()}.jpg`,
-                'image/jpeg',
-                accessToken
-              );
-
-              if (driveResult) {
-                // Update Firestore synced status
-                await updateSubmissionSyncStatusInFirestore(sub.id, true);
-                successCount++;
+          try {
+            const res = await fetch('/api/submissions/sync-all', { method: 'POST' });
+            const data = await res.json();
+            if (res.ok && data.success) {
+              if (data.syncedCount > 0) {
+                triggerNotification(`Berhasil menyinkronkan ${data.syncedCount} karya siswa ke Google Drive Guru!`, 'success');
+                const updatedList = await getStudentSubmissionsFromServer();
+                setSubmissions(updatedList);
               }
-            } catch (syncErr) {
-              console.error(`Gagal sinkronisasi submisi ${sub.id}:`, syncErr);
+            } else {
+              console.warn('Sync notice / token missing:', data.error);
             }
+          } catch (syncErr) {
+            console.error('Failed to sync via backend automation:', syncErr);
+          } finally {
+            setIsSyncingAll(false);
           }
-
-          if (successCount > 0) {
-            triggerNotification(`Berhasil menyinkronkan ${successCount} karya siswa ke Google Drive Anda!`, 'success');
-            // Reload the updated submissions list from firestore
-            const updatedList = await getStudentSubmissionsFromFirestore();
-            setSubmissions(updatedList);
-          }
-          setIsSyncingAll(false);
         }
       }
     } catch (err) {
-      console.error('Error loading or syncing submissions:', err);
+      console.error('Error loading submissions:', err);
     }
   };
 
-  const handleDeleteSubmission = (id: string) => {
-    setDeletePromptId(id);
-    setDeletePassword('');
-    setDeleteError(null);
+   const handleDeleteSubmission = (id: string) => {
+    if (isAdminUnlocked) {
+      // Direct deletion without password prompting if the teacher is already logged in
+      const idToDelete = id;
+      setIsDeletingId(idToDelete);
+      (async () => {
+        try {
+          await deleteSubmissionFromServer(idToDelete);
+          triggerNotification('Submisi siswa berhasil dihapus.', 'success');
+          loadSubmissionsAndSync(false);
+        } catch (err) {
+          console.error('Failed to delete submission:', err);
+          triggerNotification('Gagal menghapus submisi siswa.', 'error');
+        } finally {
+          setIsDeletingId(null);
+        }
+      })();
+    } else {
+      setDeletePromptId(id);
+      setDeletePassword('');
+      setDeleteError(null);
+    }
   };
 
   const confirmDeleteSubmission = async () => {
@@ -412,7 +476,7 @@ export default function App() {
 
     setIsDeletingId(id);
     try {
-      await deleteSubmissionFromFirestore(id);
+      await deleteSubmissionFromServer(id);
       triggerNotification('Submisi siswa berhasil dihapus.', 'success');
       loadSubmissionsAndSync(false);
     } catch (err) {
@@ -420,6 +484,47 @@ export default function App() {
       triggerNotification('Gagal menghapus submisi siswa.', 'error');
     } finally {
       setIsDeletingId(null);
+    }
+  };
+
+  const handleDeleteTemplatePrompt = (id: string) => {
+    setDeleteTemplatePromptId(id);
+    setDeleteTemplatePassword('');
+    setDeleteTemplateError(null);
+  };
+
+  const confirmDeleteTemplate = async () => {
+    if (!deleteTemplatePromptId) return;
+    if (deleteTemplatePassword !== 'zamrud') {
+      setDeleteTemplateError('Sandi salah! Silakan gunakan sandi yang benar.');
+      return;
+    }
+
+    const id = deleteTemplatePromptId;
+    setDeleteTemplatePromptId(null);
+    setDeleteTemplatePassword('');
+    setDeleteTemplateError(null);
+
+    try {
+      await deleteTemplateFromServer(id);
+      
+      try {
+        await deleteFrameBlob(id);
+      } catch (err) {
+        console.warn('Could not delete from IndexedDB:', err);
+      }
+
+      setTemplates(prev => prev.filter(t => t.id !== id));
+
+      if (selectedTemplateId === id) {
+        setSelectedTemplateId('custom');
+        setCustomFrameImg(null);
+      }
+
+      triggerNotification('Bingkai berhasil dihapus dari server.', 'success');
+    } catch (err) {
+      console.error('Failed to delete template:', err);
+      triggerNotification('Gagal menghapus bingkai dari server.', 'error');
     }
   };
 
@@ -566,17 +671,17 @@ export default function App() {
 
         (async () => {
           try {
-            const firestoreBase64 = await compressFrameForFirestore(file);
-            if (firestoreBase64) {
+            const serverBase64 = await compressFrameForStorage(file);
+            if (serverBase64) {
               const cloudTmpl: TwibbonTemplate = {
                 ...newTmpl,
-                imageUrl: firestoreBase64,
+                imageUrl: serverBase64,
                 localUrl: undefined
               };
-              await saveTemplateToFirestore(cloudTmpl);
+              await saveTemplateToServer(cloudTmpl);
             }
           } catch (cloudErr) {
-            console.error('Failed to sync custom template to Firestore cloud:', cloudErr);
+            console.error('Failed to sync custom template to local database:', cloudErr);
           }
         })()
       ]).catch(e => console.error('Error in background processing task:', e));
@@ -604,11 +709,11 @@ export default function App() {
       });
       setTemplates(updated);
       
-      await setGlobalDefaultTemplateInFirestore(id, updated);
+      await setGlobalDefaultTemplateOnServer(id, updated);
       triggerNotification('Bingkai Berhasil Diaktifkan! Sekarang seluruh siswa yang mengakses link ini akan otomatis memuat bingkai ini sebagai default!', 'success');
     } catch (err) {
       console.error('Failed to set global template default:', err);
-      triggerNotification('Gagal mengaktifkan bingkai utama secara global. Pastikan koneksi Firestore terkoneksi.', 'error');
+      triggerNotification('Gagal mengaktifkan bingkai utama secara global. Silakan konfirmasi koneksi server.', 'error');
     }
   };
 
@@ -719,8 +824,8 @@ export default function App() {
         const canvas = document.getElementById('twibbon-preview-canvas') as HTMLCanvasElement;
         if (canvas) {
           try {
-            // Compress canvas specifically for Firestore (optimized small size < 1MB limit)
-            const base64Image = await compressCanvasForFirestore(canvas);
+            // Compress canvas specifically for storage (optimized small size < 1MB limit)
+            const base64Image = await compressCanvasForStorage(canvas);
             
             const submissionId = `sub-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
             const newSubmission: StudentSubmission = {
@@ -734,9 +839,9 @@ export default function App() {
               syncedToDrive: false
             };
 
-            // Save to firestore!
-            await saveStudentSubmissionToFirestore(newSubmission);
-            console.log('Submission saved successfully to Firestore Queue!');
+            // Save to server!
+            await saveStudentSubmissionToServer(newSubmission);
+            console.log('Submission saved successfully to Server Queue!');
 
             // If an admin/authorized Google Drive user is connected right now, sync it immediately to Drive too!
             if (accessToken) {
@@ -748,7 +853,7 @@ export default function App() {
                     'image/png'
                   );
                   if (driveResult) {
-                    await updateSubmissionSyncStatusInFirestore(submissionId, true);
+                    await updateSubmissionSyncStatusOnServer(submissionId, true);
                     console.log('Immediate Google Drive sync completed for student!');
                   }
                 }
@@ -759,7 +864,8 @@ export default function App() {
             loadSubmissionsAndSync(false);
 
           } catch (dbErr) {
-            console.error('Error saving submission to Firestore:', dbErr);
+            console.error('Error saving submission to Server:', dbErr);
+            triggerNotification('Unduhan sukses, namun gagal mencatat submisi ke server.', 'error');
           }
         }
 
@@ -775,11 +881,12 @@ export default function App() {
 
   return (
     <div className="min-h-screen flex flex-col font-sans select-none overflow-x-hidden text-left bg-gray-50 text-slate-800">
-      <Header user={user} onLogin={handleLogin} onLogout={handleLogout} isConnecting={isConnecting} />
+      <Header user={user} onLogin={handleLogin} onLogout={handleLogout} isConnecting={isConnecting} isIframe={isIframe} />
 
       {/* Main Workspace Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
         
+
         {/* Intro Hero Section */}
         <div className="mb-8 text-left">
           <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-indigo-50 text-indigo-800 rounded-full text-xs font-bold border border-indigo-100/60 shadow-sm mb-3">
@@ -811,7 +918,8 @@ export default function App() {
                 selectedId={selectedTemplateId}
                 onSelect={handleSelectTemplate}
                 templates={templates}
-                onSetDefault={handleSetDefaultTemplate}
+                onSetDefault={isAdminUnlocked ? handleSetDefaultTemplate : undefined}
+                onDelete={isAdminUnlocked ? handleDeleteTemplatePrompt : undefined}
               />
             </motion.div>
 
@@ -1002,7 +1110,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* STEP 3: Portal Monitoring Karya Siswa / Admin Panel */}
+        {/* GALERI KARYA KELAS (ALWAYS VISIBLE TO STUDENTS) */}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -1013,93 +1121,21 @@ export default function App() {
             <div>
               <h3 className="text-lg font-bold text-slate-800 tracking-tight flex items-center gap-2">
                 <Users className="w-5 h-5 text-indigo-600" />
-                Daftar Hasil Siswa &amp; Sinkronisasi Drive
+                🖼️ Galeri Hasil Karya Kelas (Realtime)
               </h3>
               <p className="text-xs text-slate-500 font-medium mt-1 leading-relaxed">
-                Memonitor semua karya siswa dan mengunggahnya secara otomatis ke folder Google Drive utama Admin.
+                Melihat kreasi twibbon yang sudah diunduh oleh teman-teman kelas Anda secara langsung.
               </p>
             </div>
-
-            {/* Admin Portal Global Controls */}
-            <div className="flex flex-wrap items-center gap-2.5">
-              <button
-                type="button"
-                onClick={() => loadSubmissionsAndSync(false)}
-                className="inline-flex items-center gap-1.5 px-3 py-2 bg-stone-50 hover:bg-stone-100 text-stone-700 hover:text-stone-900 rounded-xl border border-stone-200 text-xs font-bold transition-all active:scale-95 shadow-sm"
-                title="Muat Ulang Data Siswa"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Muat Ulang</span>
-              </button>
-
-              {user && accessToken ? (
-                <button
-                  type="button"
-                  onClick={() => loadSubmissionsAndSync(true)}
-                  disabled={isSyncingAll || submissions.every(s => s.syncedToDrive)}
-                  className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold transition-all shadow-md ${
-                    submissions.every(s => s.syncedToDrive)
-                      ? 'bg-gray-100 text-gray-400 border border-gray-200 cursor-not-allowed shadow-none'
-                      : isSyncingAll
-                      ? 'bg-indigo-700 text-white cursor-wait animate-pulse'
-                      : 'bg-indigo-600 hover:bg-indigo-700 text-white shadow-indigo-600/10 hover:-translate-y-0.5 active:translate-y-0'
-                  }`}
-                >
-                  <Cloud className="w-4 h-4" />
-                  <span>{isSyncingAll ? 'Sinkronisasi...' : 'Sinkronkan Sekarang'}</span>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={handleLogin}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all shadow-md hover:-translate-y-0.5 active:translate-y-0 shadow-indigo-650/10"
-                >
-                  <Cloud className="w-4 h-4 fill-current" />
-                  <span>Sambung Drive Admin</span>
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* If inside an iframe, show a prominent notice with a direct Open-in-New-Tab button */}
-          {isIframe && !user && (
-            <div className="mb-6 p-4.5 rounded-2xl bg-rose-50 border border-rose-150 flex flex-col md:flex-row md:items-center justify-between gap-4 text-xs">
-              <div className="flex items-start gap-2.5">
-                <Info className="w-4.5 h-4.5 text-rose-600 flex-shrink-0 mt-0.5" />
-                <div>
-                  <p className="font-bold text-rose-950 uppercase tracking-tight">Perhatian: Pembatasan Keamanan iFrame Google AI Studio</p>
-                  <p className="text-rose-800/90 mt-1">
-                    Anda sedang menjalankan aplikasi ini di dalam bidang pratinjau iFrame AI Studio. Google tidak menyetujui penayangan dan interaksi jendela pop-up login Google Auth di dalam iFrame cross-origin.
-                  </p>
-                  <p className="text-rose-800/85 mt-1 font-bold">
-                    Untuk masuk/menyambungkan Google Drive Admin tanpa eror populasi tab (popup-closed-by-user), mohon buka aplikasi di tab mandiri dengan mengeklik tombol "Buka Tab Baru" berikut.
-                  </p>
-                </div>
-              </div>
-              <a
-                href={window.location.href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 px-4 py-2.5 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold transition-all shadow-md hover:-translate-y-0.5 active:translate-y-0 flex-shrink-0 text-center"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-                <span>Buka di Tab Baru</span>
-              </a>
-            </div>
-          )}
-
-          {/* Drive Folder Connection Info Banner */}
-          <div className="mb-6 p-4 rounded-2xl bg-amber-50/50 border border-amber-100 flex flex-col md:flex-row md:items-center justify-between gap-3 text-amber-900 leading-relaxed text-xs">
-            <div className="flex items-start gap-2.5">
-              <Info className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
-              <div>
-                <p className="font-bold text-amber-950">Informasi Folder Google Drive Admin:</p>
-                <p className="text-amber-800/90 mt-0.5">
-                  Folder target diatur otomatis ke: <strong className="font-bold underline text-indigo-900">1TTV0Z30uA_A5nU4cvdyuI3JlZyME3121</strong>. 
-                  Siswa yang mengunduh twibbon akan tersimpan sebagai submisi di sistem, dan admin dapat mengunggah semuanya ke Google Drive sekali klik atau secara otomatis.
-                </p>
-              </div>
-            </div>
+            
+            <button
+              type="button"
+              onClick={() => loadSubmissionsAndSync(false)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-stone-50 hover:bg-stone-100 text-stone-700 hover:text-stone-900 rounded-xl border border-stone-200 text-xs font-bold transition-all active:scale-95 shadow-sm self-start"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Muat Ulang Galeri</span>
+            </button>
           </div>
 
           {/* Submissions List Grid */}
@@ -1108,9 +1144,9 @@ export default function App() {
               <div className="p-3.5 bg-indigo-50 text-indigo-650 rounded-full mb-3.5 flex items-center justify-center">
                 <Users className="w-6 h-6" />
               </div>
-              <h4 className="text-slate-800 font-bold text-sm tracking-tight">Belum Ada Submisi Siswa</h4>
+              <h4 className="text-slate-800 font-bold text-sm tracking-tight">Belum Ada Karya Hari Ini</h4>
               <p className="text-slate-400 font-medium text-xs mt-1.5 max-w-sm leading-normal">
-                Saat siswa selesai memasang fotonya dan mengunduh twibbon, karyanya akan langsung terekam rapi di tabel ini secara realtime beserta nama &amp; kelasnya.
+                Jadilah siswa pertama yang mengunduh twibbon! Karya Anda akan otomatis terekam di galeri kelas ini.
               </p>
             </div>
           ) : (
@@ -1135,20 +1171,22 @@ export default function App() {
                       </div>
                     )}
                     
-                    {/* Status Badge overlays */}
-                    <div className="absolute top-2.5 right-2 tracking-wide">
-                      {sub.syncedToDrive ? (
-                        <span className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-500 text-white font-extrabold text-[9px] shadow-sm uppercase">
-                          <Check className="w-2.5 h-2.5" />
-                          <span>DI DRIVE</span>
-                        </span>
-                      ) : (
-                        <span className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-500 text-white font-extrabold text-[9px] shadow-sm uppercase">
-                          <Cloud className="w-2.5 h-2.5 animate-pulse" />
-                          <span>PENDING</span>
-                        </span>
-                      )}
-                    </div>
+                    {/* Status Badge overlays - ONLY visible if Administrator is unlocked */}
+                    {isAdminUnlocked && (
+                      <div className="absolute top-2.5 right-2 tracking-wide">
+                        {sub.syncedToDrive ? (
+                          <span className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-500 text-white font-extrabold text-[9px] shadow-sm uppercase">
+                            <Check className="w-2.5 h-2.5" />
+                            <span>DI DRIVE</span>
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1 px-2.5 py-1 rounded-full bg-amber-500 text-white font-extrabold text-[9px] shadow-sm uppercase">
+                            <Cloud className="w-2.5 h-2.5 animate-pulse" />
+                            <span>PENDING</span>
+                          </span>
+                        )}
+                      </div>
+                    )}
 
                     {/* Date/Time badge */}
                     <div className="absolute bottom-2 left-2 bg-slate-900/65 backdrop-blur-md px-2 py-0.5 rounded text-[9px] text-white font-mono font-bold">
@@ -1175,27 +1213,26 @@ export default function App() {
                         <span>Unduh</span>
                       </a>
 
-                      {/* Manual trigger to single-sync if necessary */}
-                      {!sub.syncedToDrive && accessToken && (
+                      {/* Manual trigger to single-sync if necessary (Admin Only) */}
+                      {isAdminUnlocked && !sub.syncedToDrive && (
                         <button
                           type="button"
                           onClick={async () => {
                             try {
-                              const blob = base64ToBlob(sub.imageUrl, 'image/jpeg');
-                              const res = await uploadFileToDrive(
-                                blob,
-                                `Submisi_${sub.studentClass}_${sub.studentName.replace(/\s+/g, '_')}_${Date.now()}.jpg`,
-                                'image/jpeg',
-                                accessToken
-                              );
-                              if (res) {
-                                await updateSubmissionSyncStatusInFirestore(sub.id, true);
-                                triggerNotification(`Submisi ${sub.studentName} berhasil diunggah ke Google Drive!`);
+                              setIsSyncingAll(true);
+                              const resP = await fetch('/api/submissions/sync-all', { method: 'POST' });
+                              const resJson = await resP.json();
+                              if (resP.ok && resJson.success) {
+                                triggerNotification(`Submisi ${sub.studentName} berhasil dikirim ke Google Drive!`);
                                 loadSubmissionsAndSync(false);
+                              } else {
+                                triggerNotification(resJson.error || 'Sinkronisasi gagal.', 'error');
                               }
                             } catch (err) {
                               console.error('Manual drive upload failed:', err);
                               triggerNotification('Unggahan ke Drive gagal.', 'error');
+                            } finally {
+                              setIsSyncingAll(false);
                             }
                           }}
                           className="py-1.5 px-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-[10px] font-bold flex items-center justify-center gap-1 transition-all border border-indigo-150"
@@ -1205,7 +1242,7 @@ export default function App() {
                         </button>
                       )}
 
-                      {/* Delete Entry button */}
+                      {/* Delete Entry button (Always visible, password protected for non-admins) */}
                       <button
                         type="button"
                         onClick={() => handleDeleteSubmission(sub.id)}
@@ -1222,6 +1259,164 @@ export default function App() {
             </div>
           )}
         </motion.div>
+
+        {/* AKSES KHUSUS GURU (LOCK / UNLOCK CONTROL PANEL) */}
+        {isAdminUnlocked && (
+          <motion.div
+            initial={{ opacity: 0, y: 15 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.4, delay: 0.5 }}
+            className="mt-8 bg-slate-900 text-white rounded-3xl p-6 text-left border border-slate-800"
+          >
+            <div className="space-y-6">
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 pb-4 border-b border-slate-800">
+                <div>
+                  <div className="flex items-center gap-2 text-indigo-400">
+                    <CheckCircle className="w-4 h-4 text-emerald-400" />
+                    <span className="text-[10px] font-black uppercase tracking-wider text-emerald-400">ADMINISTRATOR TERVERIFIKASI GURU</span>
+                  </div>
+                  <h3 className="text-base font-extrabold text-white mt-1">Pusat Kontrol Guru &amp; Sinkronisasi Google Drive</h3>
+                  <p className="text-xs text-slate-400 mt-1 leading-normal">
+                    Anda sudah masuk sebagai Admin Guru. Siswa dapat mengunduh langsung twibbon tanpa ribet login, dan sistem secara otomatis mengirimkan hasil download ke Google Drive Anda!
+                  </p>
+                </div>
+
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAdminUnlocked(false);
+                      sessionStorage.removeItem('twibbon_admin_unlocked');
+                      triggerNotification('Sesi Guru berhasil dikunci kembali.');
+                    }}
+                    className="px-3.5 py-2.5 bg-slate-800 hover:bg-slate-750 text-slate-300 font-bold text-xs rounded-xl transition-all border border-slate-700"
+                  >
+                    Kunci Panel (Log Out)
+                  </button>
+                </div>
+              </div>
+
+              {/* Status & Actions Row */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6 leading-relaxed text-xs">
+                {/* Left Side: Status display */}
+                <div className="bg-slate-850 p-4.5 rounded-2xl border border-slate-800 space-y-3.5">
+                  <div className="flex items-center gap-2">
+                    <Cloud className="w-5 h-5 text-indigo-400" />
+                    <span className="text-xs font-extrabold tracking-wide text-indigo-300 uppercase">Koneksi Google Drive Pusat Data</span>
+                  </div>
+
+                  <div className="space-y-1 text-slate-300 text-[11px]">
+                    <p className="flex justify-between">
+                      <span>Status Sistem:</span>
+                      <strong className="text-emerald-400">MIGRASI BEBAS KUOTA AKTIF ✅</strong>
+                    </p>
+                    <p className="flex justify-between">
+                      <span>Penyimpanan Google Drive:</span>
+                      {serverHasDriveToken ? (
+                        <strong className="text-emerald-400">SINKRONISASI AKTIF (BEBAS KUOTA) 🟢</strong>
+                      ) : (
+                        <strong className="text-rose-400">BELUM TERSAMBUNG (MENUNGGU) ⚠️</strong>
+                      )}
+                    </p>
+                    <p className="flex justify-between">
+                      <span>Target Folder ID:</span>
+                      <strong className="font-mono text-indigo-300">1RY2ZZxiq9aCurhs8xIn7xTD7x3TU1Nkv</strong>
+                    </p>
+                    <p className="flex justify-between">
+                      <span>Submisi Menunggu Sinkronisasi:</span>
+                      <strong className="text-indigo-400">{submissions.filter(s => !s.syncedToDrive).length} Berkas</strong>
+                    </p>
+                  </div>
+
+                  <p className="text-[10px] text-slate-400 italic pt-1 leading-normal">
+                    *Saat sistem tersambung, seluruh twibbon hasil kreasi 500+ siswa Anda secara realtime langsung terkirim otomatis di belakang layar ke folder Drive Anda saat mereka mengunduh!
+                  </p>
+                </div>
+
+                {/* Right Side: Google connection buttons */}
+                <div className="bg-slate-850 p-4.5 rounded-2xl border border-slate-800 flex flex-col justify-between gap-4">
+                  <div>
+                    <h5 className="font-bold text-slate-200 text-xs">Konfigurasi Google Drive Guru</h5>
+                    <p className="text-[11px] text-slate-400 mt-1 mb-3.5">
+                      Sambungkan dengan akun Google Drive Guru untuk mengaktifkan fitur pencadangan realtime otomatis 100% bebas kuota.
+                    </p>
+
+                    {isIframe && !user && (
+                      <div className="p-3 bg-indigo-950/50 border border-indigo-800/60 rounded-xl text-[11px] text-indigo-200 leading-normal mb-3.5 space-y-1.5">
+                        <p className="font-extrabold text-indigo-100 flex items-center gap-1.5">
+                          <span className="text-xs">⚠️</span> Fitur iFrame AI Studio Terbatas
+                        </p>
+                        <p className="text-slate-300">
+                          Google memblokir pop-up sign-in di dalam iframe ini. Silakan klik tombol "Sambung Drive (Tab Baru)" di bawah untuk membuka aplikasi di tab baru agar autentikasi Google aman dan lancar. 
+                        </p>
+                        <p className="font-bold text-slate-200">
+                          Setelah login sukses di tab baru, token akan tersimpan langsung di server, sehingga tampilan di frame ini akan terhubung secara otomatis!
+                        </p>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap gap-2.5 pt-2">
+                    {user && accessToken ? (
+                      <div className="flex flex-col sm:flex-row gap-2 w-full">
+                        <button
+                          type="button"
+                          onClick={() => loadSubmissionsAndSync(true)}
+                          disabled={isSyncingAll || submissions.every(s => s.syncedToDrive)}
+                          className={`flex-1 py-3 px-4 rounded-xl text-xs font-bold transition-all text-center flex items-center justify-center gap-1.5 ${
+                            submissions.every(s => s.syncedToDrive)
+                              ? 'bg-slate-850 text-slate-600 border border-slate-800 cursor-not-allowed shadow-none'
+                              : isSyncingAll
+                              ? 'bg-indigo-700 text-white cursor-wait animate-pulse'
+                              : 'bg-indigo-600 hover:bg-indigo-700 text-white shadow-lg'
+                          }`}
+                        >
+                          <Cloud className="w-4 h-4" />
+                          <span>{isSyncingAll ? 'Sedang Sinkronisasi...' : 'Sinkronisasi Semua Pending'}</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={handleLogout}
+                          className="py-3 px-4 bg-slate-800 hover:bg-slate-750 text-rose-400 hover:text-rose-300 font-bold border border-slate-700 text-xs rounded-xl transition-all"
+                        >
+                          Putuskan Sambungan
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col gap-2 w-full">
+                        <button
+                          type="button"
+                          onClick={handleLogin}
+                          disabled={isConnecting}
+                          className={`w-full py-3 px-4 rounded-xl text-xs font-bold text-center flex items-center justify-center gap-1.5 bg-indigo-600 hover:bg-indigo-700 text-white shadow-lg ${
+                            isConnecting ? 'animate-pulse cursor-wait' : ''
+                          }`}
+                        >
+                          <Cloud className="w-4 h-4 fill-current" />
+                          <span>{isConnecting ? 'Sedang Menghubungkan...' : 'Sambung Google Drive Admin'}</span>
+                        </button>
+
+                        {/* Force bulk sync using cached token even if developer logged out */}
+                        {serverHasDriveToken && (
+                          <button
+                            type="button"
+                            onClick={() => loadSubmissionsAndSync(true)}
+                            disabled={isSyncingAll}
+                            className="w-full py-2 bg-slate-850 text-slate-300 hover:bg-slate-800 hover:text-white border border-slate-750 text-xs font-bold rounded-xl transition-all flex items-center justify-center gap-1"
+                          >
+                            <RefreshCw className="w-3.5 h-3.5" />
+                            <span>Paksa Sinkron Ulang Seluruh Karya Pending</span>
+                          </button>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </motion.div>
+        )}
 
       </main>
 
@@ -1316,6 +1511,77 @@ export default function App() {
                 <button
                   type="button"
                   onClick={confirmDeleteSubmission}
+                  className="w-1/2 py-2.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl shadow-md hover:-translate-y-0.5 transition-all"
+                >
+                  Hapus
+                </button>
+              </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {/* Password Confirmation Modal for deleting templates */}
+      {deleteTemplatePromptId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm">
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="w-full max-w-sm bg-white rounded-3xl p-6 shadow-2xl border border-gray-100"
+          >
+            <div className="flex items-center gap-3 text-rose-600 mb-4">
+              <div className="p-2.5 rounded-2xl bg-rose-50 text-rose-600">
+                <Lock className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-bold text-slate-900 text-sm">Hapus Bingkai Twibbon</h3>
+                <p className="text-xs text-slate-500">Memerlukan kata sandi admin.</p>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-600 mb-4 leading-relaxed">
+              Anda sedang mencoba menghapus bingkai twibbon ini dari server. Seluruh siswa tidak akan bisa menggunakan bingkai ini lagi. Masukkan kata sandi admin:
+            </p>
+
+            <div className="space-y-3">
+              <input
+                type="password"
+                placeholder="Kata sandi..."
+                value={deleteTemplatePassword}
+                onChange={(e) => {
+                  setDeleteTemplatePassword(e.target.value);
+                  setDeleteTemplateError(null);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    confirmDeleteTemplate();
+                  }
+                }}
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-rose-500 transition-all placeholder:text-slate-400 text-slate-800"
+                autoFocus
+              />
+
+              {deleteTemplateError && (
+                <p className="text-[11px] text-rose-600 font-bold bg-rose-50 px-3 py-1.5 rounded-lg border border-rose-100">
+                  {deleteTemplateError}
+                </p>
+              )}
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteTemplatePromptId(null);
+                    setDeleteTemplatePassword('');
+                    setDeleteTemplateError(null);
+                  }}
+                  className="w-1/2 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition-all"
+                >
+                  Batal
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmDeleteTemplate}
                   className="w-1/2 py-2.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl shadow-md hover:-translate-y-0.5 transition-all"
                 >
                   Hapus

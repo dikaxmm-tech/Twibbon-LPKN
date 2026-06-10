@@ -1,15 +1,16 @@
 import React, { useState } from 'react';
 import { TemplateId, TwibbonTemplate } from '../types';
-import { Upload, Layout, Award, Map, Heart, Share2, Check, Star } from 'lucide-react';
+import { Upload, Layout, Award, Map, Heart, Share2, Check, Star, Trash2 } from 'lucide-react';
 
 interface TemplateCatalogProps {
   selectedId: TemplateId;
   onSelect: (id: TemplateId) => void;
   templates: TwibbonTemplate[];
   onSetDefault?: (id: string) => void;
+  onDelete?: (id: string) => void;
 }
 
-export default function TemplateCatalog({ selectedId, onSelect, templates, onSetDefault }: TemplateCatalogProps) {
+export default function TemplateCatalog({ selectedId, onSelect, templates, onSetDefault, onDelete }: TemplateCatalogProps) {
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const handleShare = (e: React.MouseEvent, id: string) => {
@@ -163,6 +164,19 @@ export default function TemplateCatalog({ selectedId, onSelect, templates, onSet
                         </>
                       )}
                     </button>
+                    {onDelete && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onDelete(tmpl.id);
+                        }}
+                        className="flex items-center justify-center p-1.5 rounded-lg text-rose-600 hover:text-rose-700 hover:bg-rose-50 border border-rose-100 bg-white shadow-sm transition-all"
+                        title="Hapus bingkai"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
                 )}
               </div>

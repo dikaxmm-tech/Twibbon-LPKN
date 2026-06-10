@@ -5,9 +5,10 @@ interface HeaderProps {
   onLogin: () => void;
   onLogout: () => void;
   isConnecting?: boolean;
+  isIframe?: boolean;
 }
 
-export default function Header({ user, onLogin, onLogout, isConnecting = false }: HeaderProps) {
+export default function Header({ user, onLogin, onLogout, isConnecting = false, isIframe = false }: HeaderProps) {
   return (
     <header className="border-b border-gray-200 bg-white/70 backdrop-blur-md sticky top-0 z-50">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -73,7 +74,7 @@ export default function Header({ user, onLogin, onLogout, isConnecting = false }
                 className="inline-flex items-center space-x-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold py-2 px-3.5 rounded-full transition-all duration-200 shadow-md shadow-indigo-650/10 pointer-events-auto"
               >
                 <Cloud className="w-3.5 h-3.5 fill-current" />
-                <span>{isConnecting ? 'Menghubungkan...' : 'Sambung Google Drive'}</span>
+                <span>{isConnecting ? 'Menghubungkan...' : isIframe ? 'Sambung Drive (Tab Baru)' : 'Sambung Google Drive'}</span>
               </button>
             )}
           </div>

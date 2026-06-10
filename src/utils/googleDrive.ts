@@ -2,7 +2,7 @@
  * Google Drive integration utilities for uploading files
  */
 
-const TARGET_FOLDER_ID = '1TTV0Z30uA_A5nU4cvdyuI3JlZyME3121';
+const TARGET_FOLDER_ID = '1RY2ZZxiq9aCurhs8xIn7xTD7x3TU1Nkv';
 
 interface UploadFileResponse {
   id: string;
